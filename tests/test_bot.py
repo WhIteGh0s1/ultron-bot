@@ -223,25 +223,23 @@ async def t_sticker_fallback():
 
 async def t_menu_open():
     await feed(message=msg("/menu", user=OWNER, chat=OWNER, name="Староста"))
-    ph = S.of("SendPhoto")[-1]
-    texts = [x.text for row in ph.reply_markup.inline_keyboard for x in row]
-    assert ph.chat_id == OWNER and ph.caption is None, ph.caption  # как у Ghostlink: баннер и кнопки
+    r = S.of("SendRichMessage")[-1]
+    texts = [x.text for row in r.reply_markup.inline_keyboard for x in row]
+    assert r.chat_id == OWNER and r.rich_message.html.startswith('<img src="tg://photo?id=home"/>'), r.rich_message.html[:80]
+    assert r.rich_message.media[0].id == "home" and "<footer>" in r.rich_message.html
     assert texts[0] == "⚙️ Настройки" and texts[-1] == "☁️ Сохранить в GitHub", texts
-    assert B.setting(0, "banner:home") == "BANNER_FID", "баннер кешируется"
 
 
 async def t_menu_navigation():
-    for data in ("m:chat", "m:act", "m:ch:0.35", "m:mode", "m:rules", "m:notes", "m:rem", "m:persona", "m:people",
-                 "m:person:11", "m:stats", "m:home"):
-        n = len(S.of("EditMessageMedia"))
+    for data, key in (("m:chat", "chat"), ("m:act", "chat"), ("m:ch:0.35", "chat"), ("m:mode", "chat"), ("m:rules", "rules"),
+                      ("m:notes", "notes"), ("m:rem", "rem"), ("m:persona", "persona"), ("m:people", "people"),
+                      ("m:person:11", "people"), ("m:stats", "stats"), ("m:home", "home")):
+        n = len(S.of("EditMessageText"))
         await feed(callback_query=cb(data))
-        assert len(S.of("EditMessageMedia")) == n + 1, data
-        media = S.of("EditMessageMedia")[-1].media
-        assert len(media.caption or "") <= 1024
-        key = {"m:people": "people", "m:person:11": "people", "m:stats": "stats", "m:home": "home"}.get(data)
-        if key:
-            got = media.media if isinstance(media.media, str) else media.media.path.name
-            assert got == (B.setting(0, f"banner:{key}") or f"{key}.png"), (data, got)  # свой баннер у раздела
+        assert len(S.of("EditMessageText")) == n + 1, data
+        rich = S.of("EditMessageText")[-1].rich_message
+        assert rich.html.startswith(f'<img src="tg://photo?id={key}"/>') and rich.media[0].id == key, (data, rich.html[:60])
+        assert len(rich.html) < 32768
     assert B.chance(GROUP) == 0.35 and B.setting(GROUP, "active") is False
 
 

@@ -5,3 +5,4 @@ memory/
 .venv/
 __pycache__/
 *.log
+assets/fonts/

@@ -1,23 +1,43 @@
-"""Меню старосты в стиле Ghostlink: у каждого раздела свой баннер, эмодзи прямо в тексте кнопок
-(премиум-иконки на кнопках работают только у ботов с юзернеймом с Fragment), на главной — без подписи.
-Открывается /menu в личке бота (или в группе — тогда меню придёт в личку)."""
+"""Rich-меню старосты: rich-сообщение (Bot API 10.2+) — баннер раздела картинкой сверху, ниже rich-блоки
+(премиум-эмодзи, таблицы, details, footer), под сообщением цветные кнопки с эмодзи в тексте, как у Ghostlink.
+Если клиент/сервер не умеет rich — то же самое фото + подпись. Открывается /menu в личке бота."""
 import asyncio
 import html
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
+from aiogram.methods import EditMessageText
+from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto,
+                           InputRichMessage, InputRichMessageMedia, Message)
 
 log = logging.getLogger("ultron.menu")
 router = Router()
 C = None  # модуль бота, задаётся в register()
 PENDING: dict[int, tuple[str, int]] = {}  # user_id -> (что ждём, id)
 BANNERS = Path(__file__).resolve().parent / "assets" / "banners"
+RICH = {"ok": True}  # сервер не знает rich — дальше фото+подпись
 esc = html.escape
+
+# премиум-эмодзи ProtectStatus (как в Ghostlink) — в тексте rich-сообщения рендерятся
+E = {
+    "shield": ("5902016123972358349", "🛡"), "device": ("5895652322469482989", "📱"),
+    "check": ("5895514131896733546", "✅"), "cross": ("5893163582194978381", "❌"),
+    "clock": ("5902050947567194830", "⏰"), "rocket": ("6041705726206808304", "🚀"),
+    "stats": ("5895444149699612825", "📊"), "info": ("5893290369629556374", "💡"),
+    "sparkle": ("5893321843149902412", "✨"), "star": ("5893494861612455015", "⭐️"),
+    "warning": ("5904692292324692386", "⚠️"), "profile": ("5902335789798265487", "👤"),
+    "link": ("5902449142575141204", "🔗"), "trophy": ("5893376775781617954", "🏆"),
+}
+
+
+def em(name: str) -> str:
+    i, fb = E[name]
+    return f'<tg-emoji emoji-id="{i}">{fb}</tg-emoji>'
 
 
 def b(text: str, data: str, style: str | None = None) -> InlineKeyboardButton:
@@ -31,35 +51,81 @@ def kb(*rows) -> InlineKeyboardMarkup:
 BACK = lambda data="m:home": b("◀️ Назад", data)
 
 
-# ---------- отправка: баннер раздела + подпись + кнопки ----------
+# ---------- отправка ----------
+_HASH: dict[str, str] = {}
+
+
+def bkey(key: str) -> str:
+    """Ключ кеша file_id: меняется, когда баннер перерисован."""
+    if key not in _HASH:
+        import hashlib
+        _HASH[key] = hashlib.md5((BANNERS / f"{key}.png").read_bytes()).hexdigest()[:10]
+    return f"banner:{key}:{_HASH[key]}"
+
+
 def photo(key: str):
-    return C.setting(0, f"banner:{key}") or FSInputFile(BANNERS / f"{key}.png")
+    return C.setting(0, bkey(key)) or FSInputFile(BANNERS / f"{key}.png")
 
 
-def remember_photo(key: str, sent) -> None:
-    if isinstance(sent, Message) and sent.photo and not C.setting(0, f"banner:{key}"):
-        C.set_setting(0, f"banner:{key}", sent.photo[-1].file_id)
+def cache_photo(key: str, sent) -> None:
+    """Запомнить file_id баннера из ответа Telegram, чтобы не грузить файл каждый раз."""
+    if C.setting(0, bkey(key)) or not isinstance(sent, Message):
+        return
+    ids = re.findall(r"'file_id': '([^']+)'", str(sent.model_dump(exclude_none=True)))
+    if ids:
+        C.set_setting(0, bkey(key), ids[-1])
 
 
-async def show(chat_id: int, key: str, caption: str, k: InlineKeyboardMarkup, message_id: int | None = None):
-    caption = caption[:1024] or None
-    if message_id:
+def classic(h: str) -> str:
+    """Rich-HTML → подпись к фото (если rich недоступен)."""
+    h = re.sub(r"<h\d>(.*?)</h\d>", r"<b>\1</b>\n", h)
+    h = re.sub(r"</tr>", "\n", h)
+    h = re.sub(r"</t[dh]>", " · ", h)
+    h = re.sub(r"<br\s*/?>|</p>|<hr\s*/?>|</summary>|</footer>|</blockquote>", "\n", h)
+    h = re.sub(r"<(?!/?(b|i|u|s|code|a|tg-emoji)\b)[^>]+>", "", h)
+    return re.sub(r"\n{3,}", "\n\n", h).strip()[:1024]
+
+
+async def show(chat_id: int, key: str, body: str, k: InlineKeyboardMarkup, message_id: int | None = None):
+    if RICH["ok"]:
+        rich = InputRichMessage(html=f'<img src="tg://photo?id={key}"/>' + body, skip_entity_detection=True,
+                                media=[InputRichMessageMedia(id=key, media=InputMediaPhoto(media=photo(key)))])
         try:
-            sent = await C.bot.edit_message_media(
-                chat_id=chat_id, message_id=message_id, reply_markup=k,
-                media=InputMediaPhoto(media=photo(key), caption=caption, parse_mode="HTML"))
-            remember_photo(key, sent)
+            if message_id:
+                try:
+                    sent = await C.bot(EditMessageText(chat_id=chat_id, message_id=message_id, rich_message=rich,
+                                                       reply_markup=k, parse_mode=None))
+                    cache_photo(key, sent)
+                    return
+                except TelegramBadRequest as e:
+                    if "not modified" in str(e).lower():
+                        return
+                    log.info("rich-меню не отредактировал (%s) — шлю заново", e)
+                    try:
+                        await C.bot.delete_message(chat_id, message_id)
+                    except TelegramBadRequest:
+                        pass
+            sent = await C.bot.send_rich_message(chat_id=chat_id, rich_message=rich, reply_markup=k)
+            cache_photo(key, sent)
             return
         except TelegramBadRequest as e:
-            if "not modified" in str(e).lower():
-                return
-            log.info("не отредактировал меню (%s) — шлю заново", e)
-            try:
-                await C.bot.delete_message(chat_id, message_id)
-            except TelegramBadRequest:
-                pass
-    sent = await C.bot.send_photo(chat_id, photo(key), caption=caption, reply_markup=k, parse_mode="HTML")
-    remember_photo(key, sent)
+            text = str(e).lower()
+            if "unknown method" in text or "method not found" in text or "rich" in text:
+                log.warning("rich не поддерживается — меню фото+подписью: %s", e)
+                RICH["ok"] = False
+            else:
+                raise
+    # запасной вариант: фото + подпись
+    cap = classic(body) or None
+    if message_id:
+        try:
+            await C.bot.edit_message_media(chat_id=chat_id, message_id=message_id, reply_markup=k,
+                                           media=InputMediaPhoto(media=photo(key), caption=cap, parse_mode="HTML"))
+            return
+        except TelegramBadRequest:
+            pass
+    sent = await C.bot.send_photo(chat_id, photo(key), caption=cap, reply_markup=k, parse_mode="HTML")
+    cache_photo(key, sent)
 
 
 # ---------- данные ----------
@@ -68,15 +134,14 @@ def chats() -> list[tuple[int, str]]:
 
 
 def cur_chat() -> int | None:
-    """Чат, который сейчас настраивается в меню."""
     ids = [c for c, _ in chats()]
     cid = C.setting(0, "menu_chat")
     return cid if cid in ids else (ids[0] if ids else None)
 
 
-def title(cid: int) -> str:
-    row = C.db.execute("SELECT title FROM chats WHERE chat_id=?", (cid,)).fetchone()
-    return row[0] if row else str(cid)
+def title(cid: int | None) -> str:
+    row = C.db.execute("SELECT title FROM chats WHERE chat_id=?", (cid,)).fetchone() if cid else None
+    return row[0] if row else str(cid or "—")
 
 
 def when(ts) -> str:
@@ -87,72 +152,94 @@ def pct(v: float) -> str:
     return f"{round(v * 100)}%"
 
 
-# ---------- экраны: (баннер, подпись, кнопки) ----------
+def count(sql: str, *args) -> int:
+    return C.db.execute(sql, args).fetchone()[0]
+
+
+def chat_head(cid: int) -> str:
+    active = C.setting(cid, "active", True)
+    copy = C.setting(cid, "mode", {}).get("mode") == "copy"
+    return (f"<p>{em('device')} <b>{esc(title(cid))}</b><br>"
+            f"{em('check') if active else em('cross')} Сам влезает · <b>{pct(C.chance(cid)) if active else 'выкл'}</b><br>"
+            f"{em('sparkle')} Режим · <b>{'копирование' if copy else 'обычный'}</b></p>")
+
+
+# ---------- экраны: (баннер, rich-HTML, кнопки) ----------
 def scr_home():
+    cid = cur_chat()
+    if cid:
+        body = chat_head(cid) + (
+            "<table bordered striped><tr><th>Сообщений</th><th>Людей</th><th>Правил</th><th>Напоминаний</th></tr>"
+            f"<tr><td>{count('SELECT count(*) FROM messages WHERE chat_id=?', cid)}</td>"
+            f"<td>{count('SELECT count(*) FROM people WHERE user_id!=?', C.ME['id'])}</td>"
+            f"<td>{len(C.rules(cid))}</td>"
+            f"<td>{count('SELECT count(*) FROM reminders WHERE chat_id=? AND done=0', cid)}</td></tr></table>")
+    else:
+        body = f"<p>{em('info')} Добавь меня в группу и напиши там что-нибудь — тут появится чат.</p>"
+    body += f"<footer>{em('star')} Выбери раздел</footer>"
     k = kb([b("⚙️ Настройки", "m:chat"), b("😈 Характер", "m:persona", "primary")],
            [b("⚡ Правила", "m:rules"), b("📌 Заметки", "m:notes")],
            [b("⏰ Напоминания", "m:rem"), b("👥 Люди", "m:people")],
-           [b(f"💬 Чат: {title(cur_chat())[:24]}", "m:pick")] if len(chats()) > 1 else None,
+           [b(f"💬 Чат: {title(cid)[:24]}", "m:pick")] if len(chats()) > 1 else None,
            [b("📊 Статистика", "m:stats")],
            [b("☁️ Сохранить в GitHub", "m:sync", "success")])
-    return "home", "", k
+    return "home", body, k
 
 
 def scr_pick():
     cur = cur_chat()
-    return "chat", "<b>Какой чат настраиваем?</b>", kb(
+    return "chat", f"<p>{em('device')} <b>Какой чат настраиваем?</b></p>", kb(
         *[[b(("✅ " if c == cur else "💬 ") + (t or str(c))[:30], f"m:setchat:{c}", "success" if c == cur else None)]
           for c, t in chats()], [BACK()])
 
 
 def scr_chat(cid: int):
     active = C.setting(cid, "active", True)
-    mode = C.setting(cid, "mode", {"mode": "normal"})
-    copy = mode.get("mode") == "copy"
+    copy = C.setting(cid, "mode", {}).get("mode") == "copy"
     ch = C.chance(cid)
-    who = ""
-    if copy:
-        row = C.db.execute("SELECT name FROM people WHERE user_id=?", (mode.get("user_id", 0),)).fetchone()
-        who = f" · {esc(row[0])}" if row else ""
-    cap = (f"💬 <b>{esc(title(cid))}</b>\n\n"
-           f"Сам влезает в разговор — <b>{'да, ' + pct(ch) if active else 'нет'}</b>\n"
-           f"Режим — <b>{'копирование' + who if copy else 'обычный'}</b>\n\n"
-           f"<blockquote expandable>Шанс — как часто бот сам вставляет реплику, реакцию или стикер, когда к нему не обращались. "
-           f"Копирование — бот пишет твоей манерой, с твоими словечками и опечатками.</blockquote>")
+    body = chat_head(cid) + (
+        f"<details><summary>{em('info')} <b>Что это значит</b></summary>"
+        "<p>Шанс — как часто бот сам вставляет реплику, реакцию или стикер, когда к нему не обращались.<br>"
+        "Копирование — бот пишет манерой старосты: его словечки, опечатки, без запятых.</p></details>")
     k = kb([b("✅ Сам влезает: вкл" if active else "⛔ Сам влезает: выкл", "m:act", "success" if active else "danger")],
            [b(("• " if abs(ch - v) < 0.001 else "") + pct(v), f"m:ch:{v}") for v in (0.05, 0.1, 0.2, 0.35, 0.5)],
            [b("🪞 Режим: копирование" if copy else "🗣 Режим: обычный", "m:mode", "primary")],
            [BACK()])
-    return "chat", cap, k
+    return "chat", body, k
 
 
 def scr_list(cid: int, what: str):
     items = C.rules(cid) if what == "rules" else C.notes(cid)
     hint = ("Выполняются всегда. Можно давать прямо в чате: «альтрон новое правило: …»" if what == "rules"
             else "Факты о группе: пары, дедлайны, кто за что отвечает")
-    body = "\n".join(f"<b>{n}.</b> {esc(t)}" for n, (_, t) in enumerate(items, 1)) or "пока пусто"
-    cap = f"💬 <b>{esc(title(cid))}</b>\n\n{body}\n\n<i>{hint}</i>"
-    if len(cap) > 1000:
-        cap = cap[:990] + "…"
+    rows = "".join(f"<tr><td>{n}</td><td>{esc(t)}</td></tr>" for n, (_, t) in enumerate(items, 1))
+    body = (f"<p>{em('device')} <b>{esc(title(cid))}</b></p>"
+            + (f"<table bordered striped>{rows}</table>" if rows else f"<p>{em('info')} Пока пусто</p>")
+            + f"<footer>{em('warning' if what == 'rules' else 'info')} {esc(hint)}</footer>")
     dels = [b(f"🗑 {n}", f"m:del{what}:{i}", "danger") for n, (i, _) in enumerate(items, 1)]
-    return what, cap, kb(*[dels[i:i + 4] for i in range(0, len(dels), 4)],
-                         [b("➕ Добавить", f"m:add{what}", "success")], [BACK()])
+    return what, body, kb(*[dels[i:i + 4] for i in range(0, len(dels), 4)],
+                          [b("➕ Добавить", f"m:add{what}", "success")], [BACK()])
 
 
 def scr_rem(cid: int):
     rows = C.db.execute("SELECT id,at,text FROM reminders WHERE chat_id=? AND done=0 ORDER BY at", (cid,)).fetchall()
-    body = "\n".join(f"<b>{n}.</b> <code>{when(at)}</code> {esc(t)}" for n, (_, at, t) in enumerate(rows, 1)) or "нет запланированных"
-    cap = (f"💬 <b>{esc(title(cid))}</b>\n\n{body}\n\n<i>Новые ставятся в чате: «альтрон напомни завтра в 8:30 …»</i>")[:1024]
+    table = "".join(f"<tr><td>{n}</td><td>{when(at)}</td><td>{esc(t)}</td></tr>" for n, (_, at, t) in enumerate(rows, 1))
+    body = (f"<p>{em('device')} <b>{esc(title(cid))}</b></p>"
+            + (f"<table bordered striped><tr><th>#</th><th>Когда</th><th>Что</th></tr>{table}</table>" if table
+               else f"<p>{em('clock')} Нет запланированных</p>")
+            + f"<footer>{em('info')} Новые ставятся в чате: «альтрон напомни завтра в 8:30 …»</footer>")
     dels = [b(f"🗑 {n}", f"m:delrem:{i}", "danger") for n, (i, _, _) in enumerate(rows, 1)]
-    return "rem", cap, kb(*[dels[i:i + 4] for i in range(0, len(dels), 4)], [BACK()])
+    return "rem", body, kb(*[dels[i:i + 4] for i in range(0, len(dels), 4)], [BACK()])
 
 
 def scr_persona():
     p = C.persona()
-    cap = (f"<blockquote>{esc(p) if p else 'ничего не задано — работает базовый: дерзкий, чёрный юмор, мат, держит позицию'}</blockquote>\n"
-           f"<i>Свои указания поверх базового, для всех чатов. Например: «больше чёрного юмора», «называй меня шеф»</i>")
-    return "persona", cap[:1024], kb([b("✏️ Изменить", "m:setpersona", "success"), b("🗑 Сбросить", "m:resetpersona", "danger")],
-                                     [BACK()])
+    body = (f"<p>{em('sparkle')} <b>Базовый характер</b> — дерзкий, чёрный юмор, мат к месту, держит позицию в споре, "
+            "за старосту горой.</p>"
+            f"<blockquote>{esc(p) if p else 'Своих указаний пока нет'}</blockquote>"
+            f"<footer>{em('info')} Свои указания поверх базового, для всех чатов: «больше чёрного юмора», «называй меня шеф»</footer>")
+    return "persona", body, kb([b("✏️ Изменить", "m:setpersona", "success"), b("🗑 Сбросить", "m:resetpersona", "danger")],
+                               [BACK()])
 
 
 def scr_people(page: int = 0):
@@ -160,12 +247,14 @@ def scr_people(page: int = 0):
                         (C.ME["id"],)).fetchall()
     per = 10
     part = rows[page * per:(page + 1) * per]
-    body = "\n".join(f"<b>{esc(n)}</b> · {c} сообщ. · {len(json.loads(f or '[]'))} фактов" for _, n, f, c in part) or "пока никого"
-    cap = f"Всего <b>{len(rows)}</b>\n\n{body}"
+    table = "".join(f"<tr><td>{esc(n)}</td><td>{c}</td><td>{len(json.loads(f or '[]'))}</td></tr>" for _, n, f, c in part)
+    body = (f"<p>{em('profile')} Всего <b>{len(rows)}</b></p>"
+            + (f"<table bordered striped><tr><th>Кто</th><th>Сообщений</th><th>Фактов</th></tr>{table}</table>" if table
+               else f"<p>{em('info')} Пока никого</p>"))
     btns = [b(f"👤 {n[:18]}", f"m:person:{i}") for i, n, *_ in part]
     nav = ([b("◀️", f"m:people:{page - 1}")] if page > 0 else []) + \
           ([b("▶️", f"m:people:{page + 1}")] if (page + 1) * per < len(rows) else [])
-    return "people", cap[:1024], kb(*[btns[i:i + 2] for i in range(0, len(btns), 2)], nav or None, [BACK()])
+    return "people", body, kb(*[btns[i:i + 2] for i in range(0, len(btns), 2)], nav or None, [BACK()])
 
 
 def scr_person(uid: int):
@@ -174,29 +263,33 @@ def scr_person(uid: int):
         return scr_people()
     n, u, f, c, ls = row
     facts = json.loads(f or "[]")
-    body = "\n".join(f"<b>{k}.</b> {esc(x)}" for k, x in enumerate(facts, 1)) or "ничего"
-    cap = (f"👤 <b>{esc(n)}</b>{' · @' + esc(u) if u else ''}\n"
-           f"<code>{uid}</code> · {c} сообщ. · был {when(ls)}\n\n<b>Что бот о нём знает</b>\n{body}")[:1024]
+    body = (f"<h4>{em('profile')} {esc(n)}</h4>"
+            f"<p>{'@' + esc(u) + '<br>' if u else ''}<code>{uid}</code> · {c} сообщ. · был {when(ls)}</p>"
+            f"<details open><summary>{em('info')} <b>Что бот о нём знает</b></summary>"
+            + ("".join(f"<p>{k}. {esc(x)}</p>" for k, x in enumerate(facts, 1)) or "<p>ничего</p>") + "</details>")
     dels = [b(f"🗑 {k}", f"m:delfact:{uid}:{k - 1}", "danger") for k in range(1, len(facts) + 1)]
-    return "people", cap, kb(*[dels[i:i + 4] for i in range(0, len(dels), 4)],
-                             [b("➕ Добавить факт", f"m:addfact:{uid}", "success")], [BACK("m:people")])
+    return "people", body, kb(*[dels[i:i + 4] for i in range(0, len(dels), 4)],
+                              [b("➕ Добавить факт", f"m:addfact:{uid}", "success")], [BACK("m:people")])
 
 
 def scr_stats():
-    db = C.db
     cid = cur_chat() or 0
     day = int(datetime.now().timestamp()) - 86400
-    top = db.execute("SELECT name,count(*) FROM messages WHERE chat_id=? AND user_id!=? GROUP BY user_id "
-                     "ORDER BY 2 DESC LIMIT 5", (cid, C.ME["id"])).fetchall()
-    medals = ["🥇", "🥈", "🥉", "4.", "5."]
-    cap = (f"{'💬 <b>' + esc(title(cid)) + '</b>' if cid else 'Пока ни одного чата'}\n\n"
-           f"Сообщений за сутки — <b>{db.execute('SELECT count(*) FROM messages WHERE chat_id=? AND date>=?', (cid, day)).fetchone()[0]}</b>\n"
-           f"Всего сообщений — <b>{db.execute('SELECT count(*) FROM messages').fetchone()[0]}</b>\n"
-           f"Бот написал — <b>{db.execute('SELECT count(*) FROM messages WHERE user_id=?', (C.ME['id'],)).fetchone()[0]}</b>\n"
-           f"Стикеров знает — <b>{db.execute('SELECT count(*) FROM stickers').fetchone()[0]}</b>\n"
-           f"GitHub — <b>{when(C.setting(0, 'last_sync'))}</b>\n\n"
-           f"<b>Самые болтливые</b>\n" + ("\n".join(f"{medals[i]} {esc(n)} · {c}" for i, (n, c) in enumerate(top)) or "пока никого"))
-    return "stats", cap[:1024], kb([BACK()])
+    top = C.db.execute("SELECT name,count(*) FROM messages WHERE chat_id=? AND user_id!=? GROUP BY user_id "
+                       "ORDER BY 2 DESC LIMIT 5", (cid, C.ME["id"])).fetchall()
+    medals = ["🥇", "🥈", "🥉", "4", "5"]
+    body = (f"<p>{em('device')} <b>{esc(title(cid))}</b></p>"
+            "<table bordered striped>"
+            f"<tr><td>Сообщений за сутки</td><td>{count('SELECT count(*) FROM messages WHERE chat_id=? AND date>=?', cid, day)}</td></tr>"
+            f"<tr><td>Всего сообщений</td><td>{count('SELECT count(*) FROM messages')}</td></tr>"
+            f"<tr><td>Бот написал</td><td>{count('SELECT count(*) FROM messages WHERE user_id=?', C.ME['id'])}</td></tr>"
+            f"<tr><td>Стикеров знает</td><td>{count('SELECT count(*) FROM stickers')}</td></tr>"
+            f"<tr><td>GitHub</td><td>{when(C.setting(0, 'last_sync'))}</td></tr></table>"
+            f"<h4>{em('trophy')} Самые болтливые</h4>"
+            + ("<table bordered striped>" + "".join(f"<tr><td>{medals[i]}</td><td>{esc(n)}</td><td>{c}</td></tr>"
+                                                     for i, (n, c) in enumerate(top)) + "</table>" if top
+               else "<p>пока никого</p>"))
+    return "stats", body, kb([BACK()])
 
 
 PROMPTS = {
