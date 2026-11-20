@@ -88,8 +88,20 @@ class FakeLLM:  # для зрения
 B.llm = FakeLLM()
 
 
+def make_docx_bytes() -> bytes:
+    from docx import Document
+    d = Document()
+    d.add_paragraph("Лабораторная работа 3. Базы данных")
+    d.add_paragraph("Срок сдачи: 28 ноября")
+    buf = io.BytesIO()
+    d.save(buf)
+    return buf.getvalue()
+
+
 async def fake_download(file_id):
     S.calls.append(type("Download", (), {"file_id": file_id})())
+    if file_id.startswith("DOC"):
+        return io.BytesIO(make_docx_bytes())
     return io.BytesIO(b"\xff\xd8\xff fake jpeg")
 
 B.bot.download = fake_download
@@ -196,6 +208,31 @@ async def t_photo_on_request():
     await feed(message=msg("альтрон глянь что на фото", reply_to=photo))
     assert S.of("Download"), "по просьбе фото смотрим"
     assert "[фото: расписание" in PROMPTS[-1]
+
+
+DOC_MSG: dict = {}
+
+
+async def t_doc_ignored_without_ask():
+    n = len(S.of("Download"))
+    m = msg(None, user=12, name="Катя")
+    m["caption"] = "вот методичка"
+    m["document"] = {"file_id": "DOC1", "file_unique_id": "d1", "file_name": "лаба3.docx",
+                     "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+    await feed(message=m)
+    assert len(S.of("Download")) == n, "без просьбы документ не читаем"
+    DOC_MSG.update(m)
+
+
+async def t_doc_read_on_request():
+    SCRIPT.append([{"type": "reply", "text": "сдать до 28 ноября"}])
+    await feed(message=msg("альтрон прочитай когда сдавать", reply_to=DOC_MSG))
+    assert "ДОКУМЕНТ «лаба3.docx»" in PROMPTS[-1] and "Срок сдачи: 28 ноября" in PROMPTS[-1], PROMPTS[-1][-300:]
+    # «что в том файле» без реплая — последний документ в чате, уже из кеша
+    n = len(S.of("Download"))
+    SCRIPT.append([{"type": "reply", "text": "там лаба"}])
+    await feed(message=msg("альтрон что в том файле"))
+    assert "Срок сдачи" in PROMPTS[-1] and len(S.of("Download")) == n, "второй раз из кеша"
 
 
 async def t_document():
