@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TMP = Path(tempfile.mkdtemp(prefix="altron-test-"))
-os.environ.update(BOT_TOKEN="123456:TEST", OWNER_IDS="8115200073", ALLOWED_CHATS="", ACTIVE_CHANCE="0", COOLDOWN="0",
+os.environ.update(BOT_TOKEN="123456:TEST", OWNER_IDS="1000001", ALLOWED_CHATS="", ACTIVE_CHANCE="0", COOLDOWN="0",
                   DATA_DIR=str(TMP), DB_PATH=str(TMP / "test.db"), MEMORY_REPO="", AUTO_UPDATE="0", LLM_API_KEY="test")
 sys.path.insert(0, str(ROOT))
 
@@ -23,7 +23,7 @@ from aiogram.types import Chat, ChatMemberMember, Message, MessageId, PhotoSize,
 import bot as B  # noqa: E402
 import menu as M  # noqa: E402
 
-OWNER, GROUP = 8115200073, -100500
+OWNER, GROUP = 1000001, -100500
 BOT_USER = User(id=9235003238, is_bot=True, first_name="Альтрон", username="Ultron_bad_robot", can_read_all_group_messages=True)
 
 
@@ -224,18 +224,24 @@ async def t_sticker_fallback():
 async def t_menu_open():
     await feed(message=msg("/menu", user=OWNER, chat=OWNER, name="Староста"))
     ph = S.of("SendPhoto")[-1]
-    icons = [x.icon_custom_emoji_id for row in ph.reply_markup.inline_keyboard for x in row]
-    assert ph.chat_id == OWNER and "АЛЬТРОН" in ph.caption and all(icons), icons
-    assert B.setting(0, "banner_fid") == "BANNER_FID", "баннер кешируется"
+    texts = [x.text for row in ph.reply_markup.inline_keyboard for x in row]
+    assert ph.chat_id == OWNER and ph.caption is None, ph.caption  # как у Ghostlink: баннер и кнопки
+    assert texts[0] == "⚙️ Настройки" and texts[-1] == "☁️ Сохранить в GitHub", texts
+    assert B.setting(0, "banner:home") == "BANNER_FID", "баннер кешируется"
 
 
 async def t_menu_navigation():
     for data in ("m:chat", "m:act", "m:ch:0.35", "m:mode", "m:rules", "m:notes", "m:rem", "m:persona", "m:people",
                  "m:person:11", "m:stats", "m:home"):
-        n = len(S.of("EditMessageCaption"))
+        n = len(S.of("EditMessageMedia"))
         await feed(callback_query=cb(data))
-        assert len(S.of("EditMessageCaption")) == n + 1, data
-        assert len(S.of("EditMessageCaption")[-1].caption) <= 1024
+        assert len(S.of("EditMessageMedia")) == n + 1, data
+        media = S.of("EditMessageMedia")[-1].media
+        assert len(media.caption or "") <= 1024
+        key = {"m:people": "people", "m:person:11": "people", "m:stats": "stats", "m:home": "home"}.get(data)
+        if key:
+            got = media.media if isinstance(media.media, str) else media.media.path.name
+            assert got == (B.setting(0, f"banner:{key}") or f"{key}.png"), (data, got)  # свой баннер у раздела
     assert B.chance(GROUP) == 0.35 and B.setting(GROUP, "active") is False
 
 
@@ -277,12 +283,15 @@ async def t_memory_roundtrip():
     old, total = B.db, B.db.execute("SELECT count(*) FROM messages").fetchone()[0]
     fresh = sqlite3.connect(":memory:")
     old.backup(fresh)
-    for t in ("messages", "people", "notes", "chats"):
+    for t in ("messages", *B.STATE_TABLES):
         fresh.execute(f"DELETE FROM {t}")
     B.db = fresh
     try:
         B.import_memory()
         assert fresh.execute("SELECT count(*) FROM messages").fetchone()[0] == total
+        for t in ("rules", "notes", "settings", "people", "reminders"):  # и всё состояние тоже
+            a = old.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+            assert a and fresh.execute(f"SELECT count(*) FROM {t}").fetchone()[0] == a, t
     finally:
         B.db = old
 

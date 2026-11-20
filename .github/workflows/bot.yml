@@ -1,0 +1,55 @@
+# Альтрон живёт прямо в GitHub Actions: один запуск держит бота ~5.5 часа, потом сам сохраняет память
+# и запускает следующий. Новый код (push) подхватывается за пару минут. Если что-то упало — cron раз в час поднимет снова.
+name: bot
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["README.md", "tests/**", "tools/**", "deploy/**"]
+  workflow_dispatch:
+  schedule:
+    - cron: "23 * * * *"
+
+concurrency:
+  group: altron
+  cancel-in-progress: false   # второй запуск ждёт, пока первый передаст смену
+
+permissions:
+  contents: read
+  actions: write   # чтобы бот сам запускал следующую смену
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Ключ к репозиторию памяти
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.MEMORY_DEPLOY_KEY }}" > ~/.ssh/memory
+          chmod 600 ~/.ssh/memory
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Альтрон
+        run: python -X utf8 bot.py
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          OWNER_IDS: ${{ secrets.OWNER_IDS }}
+          ALLOWED_CHATS: ${{ vars.ALLOWED_CHATS }}
+          MEMORY_URL: git@github.com:WhIteGh0s1/ultron-memory.git
+          GIT_SSH_COMMAND: ssh -i ~/.ssh/memory -o IdentitiesOnly=yes
+          DATA_DIR: ${{ runner.temp }}/altron
+          RUN_HOURS: "5.5"
+          SYNC_MINUTES: "5"
+          GITHUB_TOKEN: ${{ github.token }}
+          PYTHONUNBUFFERED: "1"

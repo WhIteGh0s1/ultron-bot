@@ -80,6 +80,10 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 MEM = DATA_DIR / "memory"  # клон приватного репозитория с историей
 MEMORY_REPO = os.environ.get("MEMORY_REPO", "")  # owner/name — склонировать память, если её нет
 GH_TOKEN = os.environ.get("GH_TOKEN", "")          # токен GitHub для пуша памяти на сервере
+MEMORY_URL = os.environ.get("MEMORY_URL", "")      # или готовый адрес (в GitHub Actions — ssh с deploy-ключом)
+RUN_HOURS = float(os.environ.get("RUN_HOURS", "0"))  # GitHub Actions: через сколько часов передать смену новому запуску
+IN_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
+STATE_TABLES = ("chats", "people", "notes", "rules", "reminders", "settings", "stickers", "sticker_sets")
 AUTO_UPDATE = os.environ.get("AUTO_UPDATE", "0") == "1"  # сам подтягивает новый код из GitHub и перезапускается
 UPDATE_MINUTES = float(os.environ.get("UPDATE_MINUTES", "10"))
 
@@ -400,9 +404,10 @@ def git(*args) -> subprocess.CompletedProcess:
 
 def ensure_memory_repo():
     """На новом сервере: склонировать приватный репозиторий памяти (MEMORY_REPO + GH_TOKEN)."""
-    if (MEM / ".git").exists() or not MEMORY_REPO:
+    if (MEM / ".git").exists() or not (MEMORY_REPO or MEMORY_URL):
         return
-    url = f"https://x-access-token:{GH_TOKEN}@github.com/{MEMORY_REPO}.git" if GH_TOKEN else f"https://github.com/{MEMORY_REPO}.git"
+    url = MEMORY_URL or (f"https://x-access-token:{GH_TOKEN}@github.com/{MEMORY_REPO}.git" if GH_TOKEN
+                         else f"https://github.com/{MEMORY_REPO}.git")
     r = subprocess.run(["git", "clone", "-q", url, str(MEM)], capture_output=True, text=True, encoding="utf-8")
     if r.returncode:
         log.warning("память не склонировал: %s", r.stderr.replace(GH_TOKEN, "***")[-200:] if GH_TOKEN else r.stderr[-200:])
@@ -448,6 +453,10 @@ def export_memory():
     write(MEM / "notes.json", json.dumps([dict(chat_id=c, title=titles.get(c), text=t, date=d)
                                           for _, c, t, d in db.execute("SELECT * FROM notes")], ensure_ascii=False, indent=1))
     write(MEM / "chats.json", json.dumps([dict(chat_id=c, title=t) for c, t in chats], ensure_ascii=False, indent=1))
+    for t in STATE_TABLES:  # полное состояние — чтобы бот поднялся где угодно (GitHub Actions каждый раз с нуля)
+        cur = db.execute(f"SELECT * FROM {t}")
+        cols = [c[0] for c in cur.description]
+        write(MEM / "state" / f"{t}.json", json.dumps([dict(zip(cols, r)) for r in cur], ensure_ascii=False, indent=0))
     git("add", "-A")
     if git("diff", "--cached", "--quiet").returncode == 0:
         return
@@ -462,8 +471,8 @@ def export_memory():
 
 
 def import_memory():
-    """Если база пустая (новый компьютер/сервер) — поднять историю из репозитория."""
-    if db.execute("SELECT count(*) FROM messages").fetchone()[0] or not (MEM / "chats").exists():
+    """Если база пустая (новый сервер, новый запуск в GitHub Actions) — поднять всё из репозитория памяти."""
+    if db.execute("SELECT count(*) FROM messages").fetchone()[0] or not MEM.exists():
         return
     n = 0
     for f in (MEM / "chats").glob("*/*.jsonl"):
@@ -474,19 +483,19 @@ def import_memory():
                        "VALUES(?,?,?,?,?,?,?,?)", (
                 cid, i["msg_id"], i["user_id"], i["name"], i["username"], i["text"], i["reply_to"], i["date"]))
             n += 1
-    if (MEM / "people.json").exists():
-        for p in json.loads((MEM / "people.json").read_text(encoding="utf-8")):
-            db.execute("INSERT OR REPLACE INTO people VALUES(?,?,?,?,?,?,?)", (
-                p["user_id"], p["name"], p["username"], json.dumps(p["facts"], ensure_ascii=False),
-                p["first_seen"], p["last_seen"], p["msg_count"]))
-    if (MEM / "notes.json").exists():
-        for x in json.loads((MEM / "notes.json").read_text(encoding="utf-8")):
-            db.execute("INSERT INTO notes(chat_id,text,date) VALUES(?,?,?)", (x["chat_id"], x["text"], x["date"]))
-    if (MEM / "chats.json").exists():
-        for c in json.loads((MEM / "chats.json").read_text(encoding="utf-8")):
-            db.execute("INSERT OR REPLACE INTO chats VALUES(?,?)", (c["chat_id"], c["title"]))
+    restored = []
+    for t in STATE_TABLES:
+        f = MEM / "state" / f"{t}.json"
+        if not f.exists():
+            continue
+        rows = json.loads(f.read_text(encoding="utf-8"))
+        for r in rows:
+            cols = list(r)
+            db.execute(f"INSERT OR REPLACE INTO {t}({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
+                       [r[c] for c in cols])
+        restored.append(f"{t}:{len(rows)}")
     db.commit()
-    log.info("поднял из GitHub-памяти %d сообщений", n)
+    log.info("поднял из GitHub-памяти %d сообщений, %s", n, " ".join(restored) or "состояния нет")
 
 
 async def sync_loop():
@@ -527,6 +536,39 @@ async def update_loop():
             os.execv(sys.executable, [sys.executable, *sys.argv])
         except Exception as e:
             log.warning("самообновление: %s", e)
+
+
+def dispatch_next_run() -> bool:
+    """GitHub Actions: запустить следующий запуск этого же workflow (передача смены)."""
+    import urllib.request
+    repo, token, wf = os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_TOKEN"), os.environ.get("WORKFLOW_FILE", "bot.yml")
+    if not (repo and token):
+        return False
+    req = urllib.request.Request(f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches",
+                                 data=json.dumps({"ref": os.environ.get("GITHUB_REF_NAME", "main")}).encode(), method="POST",
+                                 headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+    try:
+        urllib.request.urlopen(req, timeout=20)
+        return True
+    except Exception as e:
+        log.warning("не смог запустить следующий запуск: %s", e)
+        return False
+
+
+async def actions_loop():
+    """В GitHub Actions: через RUN_HOURS сохраняется и передаёт смену; если запушили новый код — тоже уступает место."""
+    started, sha = time.time(), os.environ.get("GITHUB_SHA", "")
+    while True:
+        await asyncio.sleep(120)
+        remote = (await asyncio.to_thread(code_git, "ls-remote", "origin", "refs/heads/main")).stdout.split()[:1]
+        new_code = bool(sha and remote and remote[0] != sha)
+        if new_code or (RUN_HOURS and time.time() - started > RUN_HOURS * 3600):
+            log.info("передаю смену: %s", "новый код" if new_code else "время запуска вышло")
+            await asyncio.to_thread(export_memory)
+            if not new_code:  # на push GitHub уже поставил новый запуск в очередь
+                await asyncio.to_thread(dispatch_next_run)
+            await dp.stop_polling()
+            return
 
 
 async def announce_version():
@@ -937,9 +979,11 @@ async def main():
     if not me.can_read_all_group_messages:
         log.warning("Privacy mode ВКЛЮЧЁН — бот видит только обращения к себе. "
                     "@BotFather → /setprivacy → Disable, потом удали и добавь бота в чат заново (или дай админку).")
-    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.delete_webhook(drop_pending_updates=False)  # сообщения за время перезапуска не теряем
     tasks = [asyncio.create_task(sync_loop()), asyncio.create_task(reminder_loop())]
-    if AUTO_UPDATE:
+    if IN_ACTIONS:
+        tasks.append(asyncio.create_task(actions_loop()))
+    elif AUTO_UPDATE:
         tasks.append(asyncio.create_task(update_loop()))
     await announce_version()
     try:
