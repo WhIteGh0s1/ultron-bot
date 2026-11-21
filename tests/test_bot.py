@@ -198,6 +198,8 @@ async def t_flood():
     await feed(message=msg("лол", user=12, name="Катя"))
     assert "флуд" in PROMPTS[-1] and "пишите суть чуть тише" in PROMPTS[-1]
     assert S.of("SendMessage")[-1].text == "пишите суть чуть тише"
+    B.db.execute("DELETE FROM messages WHERE msg_id>=90000")  # искусственные id не должны мешать следующим тестам
+    B.db.commit()
 
 
 async def t_photo_ignored_without_ask():
@@ -338,6 +340,28 @@ async def t_fun_actions():
         assert B.db.execute("SELECT count(*) FROM messages WHERE text LIKE '[мемный звук%'").fetchone()[0]
     finally:
         fun.sound, fun.meme = old
+
+
+async def t_reaction_pic():
+    B.load_reactions()
+    assert "битва говна и мочи" in B.reaction_list()
+    SCRIPT.append([{"type": "pic", "name": "битва говна и мочи"}])
+    await feed(message=msg("альтрон кинь битву говна и мочи"))
+    ph = S.of("SendPhoto")[-1]
+    assert ph.chat_id == GROUP
+    assert B.db.execute("SELECT file_id FROM reactions WHERE name='битва говна и мочи'").fetchone()[0], "file_id кешируется"
+
+
+async def t_argument_trigger():
+    B.last_argue.clear()
+    lines = [(11, "Дима", "ты чё несёшь, это бред"), (13, "Саня", "сам ты бред, тупой"), (11, "Дима", "заткнись лох"),
+             (13, "Саня", "иди нах, клоун"), (11, "Дима", "ты неправ вообще"), (13, "Саня", "херню не неси")]
+    n = len(PROMPTS)
+    SCRIPT.append([{"type": "pic", "name": "битва говна и мочи"}])
+    for uid, name, text in lines:
+        await feed(message=msg(text, user=uid, name=name))
+    assert len(PROMPTS) == n + 1 and "срутся" in PROMPTS[-1], PROMPTS[-1][-200:] if len(PROMPTS) > n else "нет вызова"
+    assert S.of("SendPhoto"), "кинул картинку"
 
 
 async def t_menu_open():

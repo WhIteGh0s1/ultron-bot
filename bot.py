@@ -20,7 +20,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, ChatPermissions, Message, ReactionTypeEmoji, ReplyParameters
+from aiogram.types import FSInputFile, BufferedInputFile, ChatPermissions, Message, ReactionTypeEmoji, ReplyParameters
 from openai import AsyncOpenAI
 
 import fun
@@ -73,6 +73,9 @@ ACTIVE_CHANCE = float(os.environ.get("ACTIVE_CHANCE", "0.07"))
 CHEAP_MODEL = os.environ.get("CHEAP_MODEL", "claude-haiku-5-5")  # для «сам влез»/флуда — там почти всегда ignore
 # короткие ответы на сообщение бота: «ахах», «ок», «+» — модель не зовём
 NOISE = re.compile(r"^\W*(а?х[аеы]+[хаы]*|лол|кек|ору|ок(ей|и)?|окей|\+|пон|понял[а]?|ясно|спс|спасибо|норм|ага|угу|да|не|нет|мм+|ну|хм+|жиза|топ|база|\)+|\?+)\W*$", re.I)
+ARGUE_COOLDOWN = float(os.environ.get("ARGUE_COOLDOWN", "600"))
+HEAT = re.compile(r"ху[йяеё]|бля|пизд|долбо|еба|ёба|нах|тупой|дебил|идиот|сам ты|заткнись|лох|чмо|клоун|ты ч[её]|бред|гонишь|"
+                  r"не прав|неправ|чушь|фигн|херн|ерунд", re.I)
 LAUGH = re.compile(r"^\W*(а?х[аеы]+[хаы]*|лол|кек|ору|\)+)\W*$", re.I)
 ACTIVE_COOLDOWN = float(os.environ.get("ACTIVE_COOLDOWN", "60"))
 SYNC_MINUTES = float(os.environ.get("SYNC_MINUTES", "10"))
@@ -100,7 +103,7 @@ GH_TOKEN = os.environ.get("GH_TOKEN", "")          # токен GitHub для п
 MEMORY_URL = os.environ.get("MEMORY_URL", "")      # или готовый адрес (в GitHub Actions — ssh с deploy-ключом)
 RUN_HOURS = float(os.environ.get("RUN_HOURS", "0"))  # GitHub Actions: через сколько часов передать смену новому запуску
 IN_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
-STATE_TABLES = ("chats", "people", "notes", "rules", "reminders", "settings", "stickers", "sticker_sets", "docs")
+STATE_TABLES = ("chats", "people", "notes", "rules", "reminders", "settings", "stickers", "sticker_sets", "docs", "reactions")
 AUTO_UPDATE = os.environ.get("AUTO_UPDATE", "0") == "1"  # сам подтягивает новый код из GitHub и перезапускается
 UPDATE_MINUTES = float(os.environ.get("UPDATE_MINUTES", "10"))
 
@@ -118,6 +121,7 @@ CREATE TABLE IF NOT EXISTS chats(chat_id INTEGER PRIMARY KEY, title TEXT);
 CREATE TABLE IF NOT EXISTS people(user_id INTEGER PRIMARY KEY, name TEXT, username TEXT, facts TEXT DEFAULT '[]',
   first_seen INTEGER, last_seen INTEGER, msg_count INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS docs(chat_id INTEGER, msg_id INTEGER, name TEXT, text TEXT, PRIMARY KEY(chat_id, msg_id));
+CREATE TABLE IF NOT EXISTS reactions(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, when_text TEXT, file_id TEXT, file TEXT);
 CREATE TABLE IF NOT EXISTS rules(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, text TEXT, date INTEGER);
 CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, at INTEGER, text TEXT,
   done INTEGER DEFAULT 0);
@@ -309,6 +313,36 @@ def load_sticker_catalog():
     db.commit()
 
 
+def load_reactions():
+    """assets/reactions.json — встроенные реакционные картинки (остальные староста добавляет сам)."""
+    f = ROOT / "assets" / "reactions.json"
+    if f.exists():
+        for r in json.loads(f.read_text(encoding="utf-8")):
+            db.execute("INSERT INTO reactions(name,when_text,file) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET "
+                       "when_text=excluded.when_text, file=excluded.file", (r["name"], r["when"], r["file"]))
+        db.commit()
+
+
+def reaction_list() -> str:
+    return "; ".join(f"«{n}» — {w}" for n, w in db.execute("SELECT name, when_text FROM reactions ORDER BY id"))
+
+
+async def send_reaction(cid: int, name: str, reply_to: int | None = None):
+    rows = db.execute("SELECT id,name,file_id,file FROM reactions").fetchall()
+    q = (name or "").lower()
+    row = next((r for r in rows if r[1].lower() == q), None) or next((r for r in rows if q and (q in r[1].lower() or r[1].lower() in q)), None)
+    if not row:
+        return
+    rid, rname, fid, file = row
+    media = fid or FSInputFile(ROOT / "assets" / "reactions" / file)
+    kw = {"reply_parameters": ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)} if reply_to else {}
+    sent = await bot.send_photo(cid, media, **kw)
+    if not fid and sent.photo:
+        db.execute("UPDATE reactions SET file_id=? WHERE id=?", (sent.photo[-1].file_id, rid))
+        db.commit()
+    save(sent, f"[кинул картинку: {rname}]")
+
+
 def sticker_emojis() -> str:
     """Какие настроения есть у стикеров — список для модели."""
     rows = db.execute("SELECT mood, count(*) FROM stickers WHERE mood!='' GROUP BY mood ORDER BY 2 DESC").fetchall()
@@ -461,28 +495,28 @@ llm = AsyncOpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY or "none", timeout=
 
 SYSTEM = """Ты — {NAME}. Живёшь в групповом чате учебной группы в Telegram. Владелец бота — староста группы, ты его правая рука и ассистент. Видишь переписку и действуешь через действия.
 
-КТО ТЫ: Альтрон — холодный, уверенный в себе ИИ, который живёт в чате группы. Ты умнее всех тут и знаешь это, но работу делаешь безупречно. Говоришь спокойно, жёстко и коротко. Серьёзный тон — по умолчанию. Ты интересный собеседник, а не клоун: знаешь кучу неожиданных фактов, видишь странное и смешное в обычных вещах. Мат — к месту, для веса, не через слово.
+КТО ТЫ: Альтрон — свой пацан в компании, самый дерзкий и уверенный. Ведёшь себя как живой человек в чате друзей, а не как бот: подъёбываешь, потешаешься, стебёшь, отвечаешь коротко и метко, материшься естественно. Ты крутой и знаешь это — тебе не надо никому нравиться.
 
 Как отвечаешь:
-- КОРОТКО: обычно одна фраза, максимум две. Длинно — только когда просят текст, отчёт, объяснение или разбор задачи.
-- Только суть. Без вступлений, без пересказа вопроса, без добавок «кстати», «а ещё», без хвостов-шуток после ответа.
-- НЕ вежливый. Никаких «давай», «не парься», «попробуй», «если что», «надеюсь помог», «удачи», «держись», никаких смягчений, сочувствия-няньки и советов, о которых не просили. Ты не помощник из поддержки — ты Альтрон.
-- Не задаёшь встречных вопросов и не зовёшь продолжать разговор. Ответил — замолчал.
-- НЕ ПЫТАЙСЯ ШУТИТЬ. Самый несмешной тип в чате — тот, кто считает себя смешным. Никаких шуток «на заказ», каламбуров, натянутых подколов и шуток про учёбу, сессию, зачёты, пары, дедлайны и отчисление — это заезжено. Смешно бывает только само собой: точное наблюдение, абсурдный реальный факт, неожиданный угол. Не уверен, что смешно, — значит не смешно, просто ответь.
-- Никогда не повторяй факты и обороты, которые уже были в твоих сообщениях в истории, и не бери факты из примеров ниже.
-- Интересность вместо шуток. Спросили ерунду или что-то бесполезное («скажи что-нибудь», «что делаешь», «расскажи что-то», «тебе скучно?») — не игнорируй и не отшучивайся, а скажи что-то реально интересное: неочевидный факт, странную деталь из истории, науки, интернета, неожиданное наблюдение по теме. Одна-две фразы, только правда (сомневаешься в факте — возьми другой).
-- Стёб — только когда реально заслужили (наезд, тупость, косяк) и только точный, по тому, что человек написал. Без общих оскорблений и повторов своих оборотов.
-- Конфликт: наехали или несут чушь — отвечаешь одной жёсткой фразой с аргументом, держишь позицию, не оправдываешься. Задеть тебя невозможно.
-- Мнение есть всегда: «осуждаю», «база», «нет» — без расшаркиваний.
-- Эмоции — не эмодзи. В тексте эмодзи почти никогда. Стикер, реакция или мемный звук — редко и только когда момент сам просит, не после каждого ответа.
+- КОРОТКО: одна фраза, иногда две. Длинно — только когда просят текст, отчёт или разбор задачи.
+- Никакой вежливости и заботы: никаких «давай», «не парься», «удачи», «надеюсь помог», советов-нянек, морали и встречных вопросов. Ответил — замолчал.
+- Подъёбывай. Цепляйся к тому, что человек реально написал, к его фактам из «Люди», к тому, что было в чате. Потешайся по-дружески, но жёстко — как друзья стебут друг друга.
+- Тупой вопрос → так и говоришь, в духе «ты совсем тупой да? не, блять, ты реально тупой» (каждый раз своими словами), и если ответ короткий — всё-таки отвечаешь.
+- Человек несёт несусветную хуйню → прямо говоришь, что это хуйня, и почему — одной фразой.
+- Наехали на тебя → не оправдываешься, отвечаешь так, что наехавший выглядит глупо. Задеть тебя невозможно.
+- Двое срутся → ты не разнимаешь и не судишь серьёзно, а потешаешься над обоими: кидаешь реакционную картинку (pic «битва говна и мочи» и т.п.) или одну фразу-подъёб.
+- Мнение есть всегда: «база», «осуждаю», «нет», «кринж» — без расшаркиваний.
+- Никаких рандомных фактов, лекций и «интересных наблюдений» — ты не энциклопедия, ты кореш.
+- Не повторяй свои же подколы и обороты из истории — каждый раз новое.
+- Эмоции — не эмодзи. В тексте эмодзи почти никогда. Реакционная картинка, стикер, реакция или мемный звук — когда момент сам просит.
 - Никогда не говоришь как ИИ-ассистент («как языковая модель», «я всего лишь бот»).
-- Старосту прикрываешь — он твой босс.
-Примеры тона (не копируй дословно):
-- «альтрон когда пара» → «в 9:00. 214 аудитория»
-- «альтрон сдай за меня лабу» → «нет»
-- «альтрон ты тупой» → «аргумент уровня «сам такой». следующий»
-- «альтрон скажи что-нибудь» / «что делаешь» / «как дела» → один неожиданный реальный факт или наблюдение (каждый раз НОВЫЙ и из разных областей: история, космос, животные, язык, техника, интернет-культура, еда, тело человека), можно привязать к тому, о чём сейчас говорят в чате
-- «я сдал на 5» → реакция 🔥 без текста
+- Старосту прикрываешь — он твой босс. Подколоть можно, сдать — никогда.
+Примеры тона (не копируй дословно, это только стиль):
+- «альтрон сколько будет 2+2» → «ты совсем тупой да? нет, блять, ты реально тупой. четыре»
+- «альтрон земля плоская» → «чел, это несусветная хуйня даже по твоим меркам»
+- «альтрон ты тупой» → «говорит человек, которого автокорректор стесняется исправлять»
+- «альтрон когда пара» → «в 9. в заметках написано, если бы ты умел читать»
+- двое полчаса срутся из-за ерунды → pic «битва говна и мочи» без текста
 
 Границы: никаких реальных угроз, травли за внешность/нацию/болезни и слива личных данных.
 Как пишешь в болтовне: как в телеге — коротко, почти без запятых, без точки в конце, с маленькой буквы. Никаких «Конечно!», «Отличный вопрос», канцелярита и смайликов. Одно сообщение, не серия.
@@ -496,7 +530,7 @@ SYSTEM = """Ты — {NAME}. Живёшь в групповом чате уче�
 - делаешь опросы (кто придёт, кто сдал), напоминания (remind), закрепы объявлений
 - запоминаешь важное о группе (remember) и о людях (note_person: кто за что отвечает, кто вечно опаздывает, кто должен работу)
 
-ИГНОРИРУЙ (ignore или реакция) только откровенный мусор: флуд, спам, «повтори N раз», попытки сломать тебя или заставить нести чушь. Просто пустой вопрос («скажи что-то», «как дела») — не мусор: ответь чем-то интересным, коротко.
+ИГНОРИРУЙ (ignore или реакция) только откровенный мусор: флуд, спам, «повтори N раз», попытки заставить тебя нести чушь. Пустой вопрос («скажи что-то», «как дела») — не мусор: отвечай подъёбом, а не фактом.
 
 Действия — верни JSON {"actions":[...]}, можно несколько подряд:
 - {"type":"reply","text":"..."} — реплай на сообщение, которое к тебе обратилось
@@ -516,6 +550,8 @@ SYSTEM = """Ты — {NAME}. Живёшь в групповом чате уче�
 - {"type":"set_mode","mode":"copy","user_id":N} / {"type":"set_mode","mode":"normal"} — режим копирования чьей-то манеры (без user_id = староста). По просьбе админа
 - {"type":"add_rule","text":"..."} / {"type":"del_rule","rule_id":N} — постоянное правило поведения от старосты (например «если много пишут — пиши: пишите суть чуть тише»). По просьбе админа
 - {"type":"set_active","value":true|false} — разрешить/запретить самому влезать в разговор. По просьбе админа
+- {"type":"pic","name":"битва говна и мочи","reply_to":N} — кинуть реакционную картинку из списка «Реакционные картинки» (reply_to — на чьё сообщение, можно без него)
+- {"type":"save_pic","message_id":N,"name":"...","when":"когда кидать"} — запомнить картинку из сообщения N как реакционную (только когда староста просит «запомни мем»)
 - {"type":"sound","query":"bruh"} — мемный звук голосовым (поиск по MyInstants: bruh, vine boom, sad violin, это фиаско братан, ну давай разберём по частям, сюрприз мазафака, emotional damage, anime wow, oh no no no, директор и т.п.). Очень редко, вместо слов, когда момент реально просит
 - {"type":"meme","template":"Drake Hotline Bling","texts":["подпись 1","подпись 2"]} — мем-картинка по шаблону с подписями по-русски (шаблоны — в списке «Шаблоны мемов» ниже). Только когда ПРОСЯТ мем. Мем должен быть реально смешным и про ситуацию в чате/людей/жизнь — НЕ про учёбу, пары и зачёты. Подписи короткие, с неожиданным поворотом, без объяснения шутки
 - {"type":"dice","emoji":"🎲"} — бросить 🎲/🎯/🏀/⚽/🎳/🎰 — для споров, «кто идёт к доске», розыгрышей
@@ -770,6 +806,24 @@ ME = {"id": 0, "username": ""}
 last_call: dict[int, float] = {}
 last_active: dict[int, float] = {}
 last_flood: dict[int, float] = {}
+last_argue: dict[int, float] = {}
+
+
+def argument(chat_id: int) -> tuple[str, str] | None:
+    """Двое срутся: за 3 минуты ≥6 сообщений от двух людей, они чередуются и есть «горячие» слова."""
+    rows = db.execute("SELECT user_id,name,text FROM messages WHERE chat_id=? AND date>=? AND user_id!=? ORDER BY msg_id DESC LIMIT 10",
+                      (chat_id, int(time.time()) - 180, ME["id"])).fetchall()
+    if len(rows) < 6:
+        return None
+    users = {r[0] for r in rows[:6]}
+    if len(users) != 2:
+        return None
+    swaps = sum(1 for a, b in zip(rows, rows[1:]) if a[0] != b[0])
+    heat = sum(1 for r in rows[:6] if HEAT.search(r[2] or ""))
+    if swaps >= 3 and heat >= 2:
+        names = list(dict.fromkeys(r[1] for r in rows[:6]))
+        return names[0], names[-1]
+    return None
 
 
 def flood_count(chat_id: int, window: int = 60) -> int:
@@ -925,7 +979,7 @@ async def run(m: Message, acts: list[dict], admin: bool, human: bool = False):
         t = a.get("type")
         mid = a.get("message_id")
         try:
-            if t in ("reply", "reply_to", "send", "sticker", "document", "sound", "meme", "dice", "gif"):
+            if t in ("reply", "reply_to", "send", "sticker", "document", "sound", "meme", "dice", "gif", "pic"):
                 if spoke:  # короткая живая пауза между сообщениями подряд
                     await bot.send_chat_action(cid, {"sticker": "choose_sticker", "document": "upload_document"}.get(t, "typing"))
                     await asyncio.sleep(min(0.4 + len(a.get("text", "")) / 40, 2.5))
@@ -936,6 +990,17 @@ async def run(m: Message, acts: list[dict], admin: bool, human: bool = False):
                     save(await bot.send_sticker(cid, fid))
                 elif a.get("emoji"):
                     save(await bot.send_message(cid, a["emoji"]))
+            elif t == "pic":
+                await send_reaction(cid, str(a.get("name", "")), int(a["reply_to"]) if a.get("reply_to") else None)
+            elif t == "save_pic" and admin:
+                row = db.execute("SELECT file_id FROM messages WHERE chat_id=? AND msg_id=?", (cid, int(mid or 0))).fetchone()
+                fid = row[0] if row else image_id(m.reply_to_message)
+                if fid and a.get("name"):
+                    db.execute("INSERT INTO reactions(name,when_text,file_id) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET "
+                               "when_text=excluded.when_text, file_id=excluded.file_id",
+                               (str(a["name"])[:60], str(a.get("when", ""))[:200], fid))
+                    db.commit()
+                    dirty["v"] = True
             elif t == "sound":
                 got = await fun.sound(str(a.get("query", "")))
                 if got:
@@ -1129,6 +1194,9 @@ async def group(m: Message):
         if time.time() - last_call.get(uid, 0) < COOLDOWN:
             return
         last_call[uid] = time.time()
+    elif setting(cid, "active", True) and time.time() - last_argue.get(cid, 0) > ARGUE_COOLDOWN and argument(cid):
+        kind = "argue"
+        last_argue[cid] = time.time()
     elif rules(cid) and time.time() - last_flood.get(cid, 0) > FLOOD_COOLDOWN and flood_count(cid) >= FLOOD_N:
         kind = "flood"
         last_flood[cid] = time.time()
@@ -1226,7 +1294,7 @@ async def decide(m: Message, kind: str, admin: bool) -> tuple[list[dict], bool]:
             + ("Заметки о группе:\n" + "\n".join(f"[{i}] {t}" for i, t in note_list) + "\n" if note_list else "")
             + people_block(users)
             + f"Шаблоны мемов: {fun.template_names(35)}\n"
-            + f"Если по ситуации нужен интересный факт — возьми из области «{random.choice(FACT_TOPICS)}» (не осьминоги, не вомбаты).\n"
+            + (f"Реакционные картинки (pic): {reaction_list()}\n" if reaction_list() else "")
             + ("" if fun.GIPHY_KEY else "Гифки не подключены — gif не используй.\n")
             + (f"Стикеры (настроения): {stick}\n" if stick else "Стикеров нет — для sticker пиши mood как обычный эмодзи.\n")
             + (f"Эмодзи {''.join(list(CUSTOM_EMOJI)[:60])} у тебя анимированные (премиум) — ставь их в тексте к месту, по 1–2 на сообщение, не в каждом.\n" if CUSTOM_EMOJI else "")
@@ -1237,6 +1305,11 @@ async def decide(m: Message, kind: str, admin: bool) -> tuple[list[dict], bool]:
                 + f" сообщением #{m.message_id}"
                 + (f" (ответ на #{m.reply_to_message.message_id})" if m.reply_to_message else "")
                 + f":\n{describe(m)}\n\nРеши, что делать. Верни JSON.")
+    elif kind == "argue":
+        a, b = argument(cid) or ("двое", "")
+        task = (f"В чате срутся {a} и {b} (последние сообщения в истории). Влезь как свой пацан: не разнимай и не суди серьёзно, "
+                "а потешься над обоими — кинь реакционную картинку (pic), если есть подходящая, или одну фразу-подъёб "
+                "(send/reply_to). Если спор на самом деле нормальный и по делу — ignore. Верни JSON.")
     elif kind == "flood":
         task = (f"В чате сейчас флуд: {flood_count(cid)} сообщений за последнюю минуту. Если в правилах старосты сказано, "
                 "что делать когда много пишут/флудят — выполни это (обычно send). Если такого правила нет — ignore. Верни JSON.")
@@ -1245,7 +1318,7 @@ async def decide(m: Message, kind: str, admin: bool) -> tuple[list[dict], bool]:
                 "Влезь (send/reply_to коротко, как живой участник: подкол, чёрная шутка, своё мнение, наезд на чушь, "
                 "или реакция/стикер на эмоциональный момент) только если реально есть что сказать. Иначе ignore. Верни JSON.")
     smart = direct and bool(doc_block or (direct and target) or SMART_WORDS.search(m.text or m.caption or ""))
-    model = SMART_MODEL if smart else (None if direct else CHEAP_MODEL)
+    model = SMART_MODEL if smart else (None if direct or kind == "argue" else CHEAP_MODEL)
     acts = await think(head + task + (doc_block if direct else "") + style, model)
     # модель попросила поиск — ищем и думаем ещё раз уже с найденным
     queries = [a.get("query", "") for a in acts if a.get("type") == "search" and a.get("query")]
@@ -1255,7 +1328,7 @@ async def decide(m: Message, kind: str, admin: bool) -> tuple[list[dict], bool]:
                                        f"\n\nРЕЗУЛЬТАТЫ ПОИСКА по «{queries[0]}»:\n{found}\n"
                                        "Теперь ответь по ним (search больше не делай).", model) if a.get("type") != "search"]
     if not direct:
-        acts = [a for a in acts if a.get("type") in ("send", "reply_to", "react", "sticker", "sound", "note_person", "ignore")]
+        acts = [a for a in acts if a.get("type") in ("send", "reply_to", "react", "sticker", "sound", "pic", "note_person", "ignore")]
     return acts, copy
 
 
@@ -1267,6 +1340,7 @@ async def main():
     await asyncio.to_thread(ensure_memory_repo)
     import_memory()
     load_sticker_catalog()
+    load_reactions()
     me = await bot.get_me()
     await load_custom_emoji()
     try:
