@@ -69,8 +69,12 @@ SCRIPT: list[list[dict]] = []   # что «модель» ответит на с
 PROMPTS: list[str] = []
 
 
-async def fake_think(prompt):
+MODELS: list = []
+
+
+async def fake_think(prompt, model=None):
     PROMPTS.append(prompt)
+    MODELS.append(model)
     return SCRIPT.pop(0) if SCRIPT else [{"type": "ignore"}]
 
 B.think = fake_think
@@ -158,6 +162,7 @@ async def t_reply():
     sent = S.of("SendMessage")[-1]
     assert sent.reply_parameters.message_id == m["message_id"]
     assert sent.text == "Ну привет", sent.text  # без точки в конце
+    assert MODELS[-1] is None, "болтовня — быстрая модель"
 
 
 async def t_poll():
@@ -208,6 +213,8 @@ async def t_photo_on_request():
     await feed(message=msg("альтрон глянь что на фото", reply_to=photo))
     assert S.of("Download"), "по просьбе фото смотрим"
     assert "[фото: расписание" in PROMPTS[-1]
+    r = S.of("SetMessageReaction")[-1]
+    assert r.reaction[0].emoji == "👀", "сначала глазки, потом ответ"
 
 
 DOC_MSG: dict = {}
@@ -228,6 +235,7 @@ async def t_doc_read_on_request():
     SCRIPT.append([{"type": "reply", "text": "сдать до 28 ноября"}])
     await feed(message=msg("альтрон прочитай когда сдавать", reply_to=DOC_MSG))
     assert "ДОКУМЕНТ «лаба3.docx»" in PROMPTS[-1] and "Срок сдачи: 28 ноября" in PROMPTS[-1], PROMPTS[-1][-300:]
+    assert MODELS[-1] == B.SMART_MODEL, "файлы читает умная модель"
     # «что в том файле» без реплая — последний документ в чате, уже из кеша
     n = len(S.of("Download"))
     SCRIPT.append([{"type": "reply", "text": "там лаба"}])
@@ -256,6 +264,28 @@ async def t_sticker_fallback():
     SCRIPT.append([{"type": "sticker", "emoji": "😂"}])
     await feed(message=msg("альтрон ахах"))
     assert S.of("SendMessage")[-1].text == "😂"  # своих стикеров нет — большой эмодзи
+
+
+async def t_premium_emoji():
+    B.CUSTOM_EMOJI.update({"🔥": "111", "✅": "222"})
+    try:
+        out = B.premium_emoji('красава 🔥 <b>сдал ✅</b> <tg-emoji emoji-id="9">🔥</tg-emoji>')
+        assert out.count('emoji-id="111"') == 1 and 'emoji-id="222"' in out and 'emoji-id="9"' in out, out
+        SCRIPT.append([{"type": "reply", "text": "огонь 🔥"}])
+        await feed(message=msg("альтрон как я"))
+        assert '<tg-emoji emoji-id="111">🔥</tg-emoji>' in S.of("SendMessage")[-1].text
+    finally:
+        B.CUSTOM_EMOJI.clear()
+
+
+async def t_sticker_by_mood():
+    B.db.executemany("INSERT OR REPLACE INTO stickers(uid,file_id,emoji,set_name,mood,descr) VALUES(?,?,?,?,?,?)",
+                     [("u1", "ST_CRINGE", "🤩", "p", "кринж", "кот морщится"), ("u2", "ST_LOL", "🤩", "p", "смех", "ржущий мужик")])
+    B.db.commit()
+    SCRIPT.append([{"type": "sticker", "mood": "кринж", "about": "дима опять"}])
+    await feed(message=msg("альтрон ну и кринж"))
+    assert S.of("SendSticker")[-1].sticker == "ST_CRINGE"
+    assert "кринж" in B.sticker_emojis()
 
 
 async def t_menu_open():

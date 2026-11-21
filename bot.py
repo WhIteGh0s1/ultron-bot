@@ -63,7 +63,8 @@ ALLOWED_CHATS = ids(os.environ.get("ALLOWED_CHATS"))
 OWNER_IDS = ids(os.environ.get("OWNER_IDS"))
 BOT_NAMES = [n.strip().lower() for n in os.environ.get("BOT_NAMES", "альтрон,ультрон").split(",") if n.strip()]
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://tooken.club/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "claude-haiku-5-5")  # ~5 с против ~18 с у deepseek на полном промпте
+LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-5-5")  # лучший по живости/юмору на тестах, ~5–8 с (deepseek 16–87 с)
+FALLBACK_MODELS = [x.strip() for x in os.environ.get("FALLBACK_MODELS", "gpt-6.2-sol,claude-haiku-5-5").split(",") if x.strip()]
 LLM_API_KEY = os.environ.get("LLM_API_KEY") or user_env("TOKEN_CLUB_API_KEY")
 HISTORY = int(os.environ.get("HISTORY", "60"))
 COOLDOWN = float(os.environ.get("COOLDOWN", "1.5"))
@@ -71,7 +72,14 @@ ACTIVE_CHANCE = float(os.environ.get("ACTIVE_CHANCE", "0.2"))
 ACTIVE_COOLDOWN = float(os.environ.get("ACTIVE_COOLDOWN", "60"))
 SYNC_MINUTES = float(os.environ.get("SYNC_MINUTES", "10"))
 PERSONA = os.environ.get("PERSONA", "")
-VISION_MODEL = os.environ.get("VISION_MODEL", "claude-haiku-5-5")
+VISION_MODEL = os.environ.get("VISION_MODEL", "gpt-6.2-sol")      # смотрит фото
+SMART_MODEL = os.environ.get("SMART_MODEL", "gpt-6.2-sol")        # отвечает, когда есть файл/фото или серьёзная задача
+EMOJI_PACKS = [x.strip() for x in os.environ.get("EMOJI_PACKS", "ProtectStatus").split(",") if x.strip()]
+SMART_WORDS = re.compile(r"отч[её]т|напиши|составь|объясни|реши|задач|помоги|переделай|исправь|проверь|расскажи|почему|как сделать", re.I)
+STICKER_MOODS = ["смех", "угар", "шок", "ахуел", "кринж", "стыд", "грусть", "плачу", "злость", "бешенство", "осуждаю",
+                 "неодобрение", "одобрение", "респект", "красава", "любовь", "милота", "флирт", "думаю", "подозрение",
+                 "наблюдаю", "жду", "скука", "сплю", "устал", "привет", "пока", "спасибо", "извини", "ура", "победа",
+                 "страх", "похуй", "дерзость", "тупость", "согласен", "нет", "учёба", "еда", "деньги", "танцую", "мем"]
 FLOOD_N = int(os.environ.get("FLOOD_N", "15"))            # сообщений за минуту = флуд
 FLOOD_COOLDOWN = float(os.environ.get("FLOOD_COOLDOWN", "300"))
 DOC_WORDS = re.compile(r"док|файл|pdf|пдф|ворд|word|таблиц|excel|эксел|прочит|прочт|отч[её]т|презентац", re.I)
@@ -277,16 +285,87 @@ def style_of(user_id: int) -> tuple[str, str]:
 
 
 # ---------- стикеры ----------
+for col in ("mood", "descr"):
+    if col not in [r[1] for r in db.execute("PRAGMA table_info(stickers)")]:
+        db.execute(f"ALTER TABLE stickers ADD COLUMN {col} TEXT DEFAULT ''")
+RECENT_STICKERS: list[str] = []
+
+
+def load_sticker_catalog():
+    """assets/stickers.json — стикеры, подписанные моделью с картинками (эмодзи в паках врут)."""
+    f = ROOT / "assets" / "stickers.json"
+    if not f.exists():
+        return
+    for c in json.loads(f.read_text(encoding="utf-8")):
+        db.execute("INSERT INTO stickers(uid,file_id,emoji,set_name,mood,descr) VALUES(?,?,?,?,?,?) "
+                   "ON CONFLICT(uid) DO UPDATE SET mood=excluded.mood, descr=excluded.descr",
+                   (c["uid"], c["file_id"], c["emoji"], c["set"], c["mood"], c["desc"]))
+    db.commit()
+
+
 def sticker_emojis() -> str:
-    rows = db.execute("SELECT emoji FROM stickers WHERE emoji!='' GROUP BY emoji ORDER BY count(*) DESC LIMIT 60").fetchall()
-    return " ".join(r[0] for r in rows)
+    """Какие настроения есть у стикеров — список для модели."""
+    rows = db.execute("SELECT mood, count(*) FROM stickers WHERE mood!='' GROUP BY mood ORDER BY 2 DESC").fetchall()
+    return ", ".join(r[0] for r in rows)
 
 
-def pick_sticker(emoji: str) -> str | None:
-    e = (emoji or "").replace("️", "")
-    row = db.execute("SELECT file_id FROM stickers WHERE replace(emoji, char(65039), '')=? ORDER BY random() LIMIT 1",
-                     (e,)).fetchone()
-    return row[0] if row else None
+def pick_sticker(mood: str, about: str = "") -> str | None:
+    mood = (mood or "").strip().lower()
+    rows = db.execute("SELECT file_id, descr FROM stickers WHERE mood=?", (mood,)).fetchall()
+    if not rows and mood:  # настроение не нашлось — ищем по описанию
+        rows = db.execute("SELECT file_id, descr FROM stickers WHERE descr LIKE ?", (f"%{mood}%",)).fetchall()
+    if not rows:
+        e = mood.replace("\ufe0f", "")
+        rows = db.execute("SELECT file_id, descr FROM stickers WHERE replace(emoji, char(65039), '')=?", (e,)).fetchall()
+    if not rows:
+        return None
+    words = {w for w in re.findall(r"\w{4,}", about.lower())}
+    fresh = [r for r in rows if r[0] not in RECENT_STICKERS] or rows
+    if words:
+        fresh.sort(key=lambda r: -len(words & set(re.findall(r"\w{4,}", (r[1] or "").lower()))))
+        best = fresh[:3]
+    else:
+        best = fresh
+    fid = random.choice(best)[0]
+    RECENT_STICKERS.append(fid)
+    del RECENT_STICKERS[:-15]
+    return fid
+
+
+# ---- кастомные (премиум) эмодзи: обычный эмодзи в тексте → анимированный из пака ----
+CUSTOM_EMOJI: dict[str, str] = {}
+
+
+async def load_custom_emoji():
+    for name in EMOJI_PACKS:
+        try:
+            pack = await bot.get_sticker_set(name)
+        except Exception as e:
+            log.warning("пак эмодзи %s не загрузил: %s", name, e)
+            continue
+        for st in pack.stickers:
+            if st.custom_emoji_id and st.emoji:
+                e = st.emoji.replace("️", "")
+                if e not in ("©", "®", "™"):
+                    CUSTOM_EMOJI.setdefault(e, st.custom_emoji_id)
+    if "♥" in CUSTOM_EMOJI:
+        CUSTOM_EMOJI.setdefault("❤", CUSTOM_EMOJI["♥"])
+    log.info("кастомных эмодзи: %d", len(CUSTOM_EMOJI))
+
+
+def premium_emoji(html_text: str) -> str:
+    """Подменяет эмодзи на анимированные (только вне HTML-тегов и уже готовых tg-emoji)."""
+    if not CUSTOM_EMOJI:
+        return html_text
+    keys = sorted(CUSTOM_EMOJI, key=len, reverse=True)
+    rx = re.compile("(" + "|".join(re.escape(k) + "\ufe0f?" for k in keys) + ")")
+    parts = re.split(r"(<tg-emoji[^>]*>.*?</tg-emoji>|<[^>]+>)", html_text)
+    for i, part in enumerate(parts):
+        if part.startswith("<"):
+            continue
+        parts[i] = rx.sub(lambda mm: f'<tg-emoji emoji-id="{CUSTOM_EMOJI[mm.group(1).replace(chr(0xfe0f), "")]}">'
+                                     f'{mm.group(1)}</tg-emoji>', part)
+    return "".join(parts)
 
 
 async def learn_stickers(st) -> int:
@@ -395,7 +474,7 @@ SYSTEM = """Ты — {NAME}. Живёшь в групповом чате уче�
 - {"type":"reply","text":"..."} — реплай на сообщение, которое к тебе обратилось
 - {"type":"reply_to","message_id":N,"text":"..."} — реплай на другое сообщение
 - {"type":"send","text":"..."} — просто написать в чат
-- {"type":"sticker","emoji":"😂"} — стикер с эмоцией (эмодзи из списка доступных стикеров; если списка нет — просто эмодзи, покажется большим)
+- {"type":"sticker","mood":"кринж","about":"пара слов о ситуации"} — кинуть стикер: mood — одно настроение из списка «Стикеры» ниже, about — о чём момент (подберу похожий). Кидай к месту, иногда вместо текста
 - {"type":"react","message_id":N,"emoji":"👍"} — реакция (только: 👍 👎 ❤ 🔥 👏 😁 🤔 🤯 😱 🎉 🤩 🙏 👌 🤡 🥱 💯 🤣 ⚡ 🏆 💔 🤨 😐 👀 🤝 ✍ 🫡 🗿 😎 🤷 😭 😴 🌚 🙈 💅 🖕 😈 🤬 🤮 💩)
 - {"type":"poll","question":"...","options":["..",".."],"anonymous":false,"multiple":false,"quiz_correct":null,"explanation":null} — опрос (2–10 вариантов; quiz_correct = индекс верного для викторины)
 - {"type":"document","filename":"Отчёт.docx","title":"...","text":"..."} — прислать Word-документ (строки «- » станут списком). Подпись к файлу — отдельным reply
@@ -417,26 +496,29 @@ SYSTEM = """Ты — {NAME}. Живёшь в групповом чате уче�
 Ответ — строго JSON, без текста вокруг."""
 
 
-async def think(prompt: str) -> list[dict]:
+async def think(prompt: str, model: str | None = None) -> list[dict]:
     msgs = [{"role": "system", "content": SYSTEM.replace("{NAME}", BOT_TITLE)
              + ("\n\nДоп. указания владельца по характеру: " + persona() if persona() else "")},
             {"role": "user", "content": prompt}]
-    for kw in ({}, {"response_format": {"type": "json_object"}}):
-        try:
-            r = await llm.chat.completions.create(model=LLM_MODEL, messages=msgs, temperature=0.8,
-                                                  max_tokens=2500, **kw)
-            raw = r.choices[0].message.content or ""
-            m = re.search(r"\{.*\}", raw, re.S)
-            data = json.loads(m.group(0)) if m else None
-            if data is None:
-                log.warning("не JSON: %r", raw[:200])
-                continue
-            acts = data.get("actions", [data] if "type" in data else [])
-            return [a for a in acts if isinstance(a, dict)]
-        except json.JSONDecodeError:
-            log.warning("битый JSON: %r", raw[:200])
-        except Exception as e:
-            log.warning("LLM ошибка: %s", e)
+    chain = list(dict.fromkeys([model or LLM_MODEL, *FALLBACK_MODELS]))
+    for mdl in chain:  # модель лежит / лимит — пробуем следующую
+        for kw in ({}, {"response_format": {"type": "json_object"}}):
+            raw = ""
+            try:
+                r = await llm.chat.completions.create(model=mdl, messages=msgs, temperature=0.8, max_tokens=2500, **kw)
+                raw = r.choices[0].message.content or ""
+                m = re.search(r"\{.*\}", raw, re.S)
+                data = json.loads(m.group(0)) if m else None
+                if data is None:
+                    log.warning("%s: не JSON: %r", mdl, raw[:200])
+                    continue
+                acts = data.get("actions", [data] if "type" in data else [])
+                return [a for a in acts if isinstance(a, dict)]
+            except json.JSONDecodeError:
+                log.warning("%s: битый JSON: %r", mdl, raw[:200])
+            except Exception as e:
+                log.warning("%s: ошибка: %s", mdl, str(e)[:200])
+                break  # к следующей модели
     return []
 
 
@@ -747,6 +829,7 @@ async def say(chat_id: int, text: str, reply_to: int | None = None, human: bool 
     if not formal:
         text = humanize(text) if human else casual(text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text).strip()
+    text = premium_emoji(text)
     for part in chunks(text):
         kw = {"reply_parameters": ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)} if reply_to else {}
         try:
@@ -779,7 +862,7 @@ async def run(m: Message, acts: list[dict], admin: bool, human: bool = False):
                     await asyncio.sleep(min(0.4 + len(a.get("text", "")) / 40, 2.5))
                 spoke = True
             if t == "sticker":
-                fid = pick_sticker(a.get("emoji", ""))
+                fid = pick_sticker(a.get("mood") or a.get("emoji", ""), a.get("about", ""))
                 if fid:
                     save(await bot.send_sticker(cid, fid))
                 elif a.get("emoji"):
@@ -963,10 +1046,19 @@ async def group(m: Message):
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
 
+async def eyes(m: Message):
+    """Сначала глазки 👀 — «смотрю», потом ответ."""
+    try:
+        await bot.set_message_reaction(m.chat.id, m.message_id, [ReactionTypeEmoji(emoji="👀")])
+    except Exception:
+        pass
+
+
 async def decide(m: Message, kind: str, admin: bool) -> tuple[list[dict], bool]:
     cid, uid = m.chat.id, m.from_user.id
     direct = kind == "direct"
     doc_block = ""
+    target = None
     if direct:
         await bot.send_chat_action(cid, "typing")
         # смотрим картинку только когда просят: фото в самом сообщении, в реплае, или «глянь фото» — последнее в чате
@@ -977,6 +1069,7 @@ async def decide(m: Message, kind: str, admin: bool) -> tuple[list[dict], bool]:
                              "ORDER BY msg_id DESC LIMIT 1", (cid, m.message_id - 30)).fetchone()
             target = tuple(row) if row else None
         if target:
+            await eyes(m)
             await look(cid, target[0], target[1], m.text or m.caption or "")
         doc_msg = m if doc_of(m) else m.reply_to_message if doc_of(m.reply_to_message) else None
         doc = None
@@ -990,6 +1083,8 @@ async def decide(m: Message, kind: str, admin: bool) -> tuple[list[dict], bool]:
                 nm = re.search(r"\[файл ([^\]]*)\]", row[2])
                 doc = (row[0], row[1], nm.group(1).strip() if nm else "файл.txt")
         if doc:
+            if not target:
+                await eyes(m)
             await bot.send_chat_action(cid, "typing")
             text = await read_doc(cid, *doc)
             if text:
@@ -1014,7 +1109,8 @@ async def decide(m: Message, kind: str, admin: bool) -> tuple[list[dict], bool]:
                + "\n".join(f"[{i}] {t}" for i, t in rule_list) + "\n" if rule_list else "")
             + ("Заметки о группе:\n" + "\n".join(f"[{i}] {t}" for i, t in note_list) + "\n" if note_list else "")
             + people_block(users)
-            + (f"Доступные стикеры (эмодзи): {stick}\n" if stick else "Своих стикеров нет — для sticker бери обычный эмодзи.\n")
+            + (f"Стикеры (настроения): {stick}\n" if stick else "Стикеров нет — для sticker пиши mood как обычный эмодзи.\n")
+            + (f"Эмодзи {''.join(list(CUSTOM_EMOJI)[:60])} у тебя анимированные (премиум) — ставь их в тексте к месту, по 1–2 на сообщение, не в каждом.\n" if CUSTOM_EMOJI else "")
             + f"\nИстория:\n{hist}\n\n")
     if direct:
         task = (f"К тебе обратился {m.from_user.full_name} [id {uid}]"
@@ -1029,7 +1125,8 @@ async def decide(m: Message, kind: str, admin: bool) -> tuple[list[dict], bool]:
         task = (f"К тебе НЕ обращались. Последнее сообщение #{m.message_id} от {m.from_user.full_name}: {describe(m)}\n"
                 "Влезь (send/reply_to коротко, как живой участник: подкол, чёрная шутка, своё мнение, наезд на чушь, "
                 "или реакция/стикер на эмоциональный момент) только если реально есть что сказать. Иначе ignore. Верни JSON.")
-    acts = await think(head + task + (doc_block if direct else "") + style)
+    smart = direct and bool(doc_block or (direct and target) or SMART_WORDS.search(m.text or m.caption or ""))
+    acts = await think(head + task + (doc_block if direct else "") + style, SMART_MODEL if smart else None)
     if not direct:
         acts = [a for a in acts if a.get("type") in ("send", "reply_to", "react", "sticker", "note_person", "ignore")]
     return acts, copy
@@ -1042,7 +1139,9 @@ async def main():
         raise SystemExit("Нет ключа модели: LLM_API_KEY в .env или переменная TOKEN_CLUB_API_KEY")
     await asyncio.to_thread(ensure_memory_repo)
     import_memory()
+    load_sticker_catalog()
     me = await bot.get_me()
+    await load_custom_emoji()
     ME.update(id=me.id, username=me.username or "")
     if me.username and me.username.lower() not in BOT_NAMES:
         BOT_NAMES.append(me.username.lower())
