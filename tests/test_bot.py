@@ -288,6 +288,32 @@ async def t_sticker_by_mood():
     assert "кринж" in B.sticker_emojis()
 
 
+async def t_no_tokens_on_noise():
+    bot_msg = {"message_id": 4242, "date": int(time.time()), "chat": {"id": GROUP, "type": "supergroup", "title": "ИСП-21"},
+               "from": {"id": BOT_USER.id, "is_bot": True, "first_name": "Альтрон"}, "text": "дима стабилен"}
+    n = len(PROMPTS)
+    for t in ("ахахах", "ок", "+", "))"):
+        await feed(message=msg(t, reply_to=bot_msg))
+    assert len(PROMPTS) == n, "на «ахах»/«ок» в ответ боту модель не зовём"
+    SCRIPT.append([{"type": "reply", "text": "в 9"}])
+    await feed(message=msg("а во сколько пара", reply_to=bot_msg))
+    assert len(PROMPTS) == n + 1, "нормальный вопрос реплаем — отвечаем"
+
+
+async def t_search_then_answer():
+    async def fake_search(q):
+        return "[ru] ЛАРП: ролевая игра живого действия"
+    old = B.web_search
+    B.web_search = fake_search
+    try:
+        SCRIPT.append([{"type": "search", "query": "ларп"}])
+        SCRIPT.append([{"type": "reply", "text": "ларпер — тот кто отыгрывает роль"}])
+        await feed(message=msg("альтрон кто такой ларпер"))
+        assert "РЕЗУЛЬТАТЫ ПОИСКА" in PROMPTS[-1] and S.of("SendMessage")[-1].text.startswith("ларпер")
+    finally:
+        B.web_search = old
+
+
 async def t_menu_open():
     await feed(message=msg("/menu", user=OWNER, chat=OWNER, name="Староста"))
     r = S.of("SendRichMessage")[-1]
