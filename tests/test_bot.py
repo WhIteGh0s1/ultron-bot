@@ -320,6 +320,26 @@ async def t_learn_slang():
     assert any(x["term"] == "тюбик" for x in B.setting(0, "slang", []))
 
 
+async def t_fun_actions():
+    import fun
+
+    async def fake_sound(q):
+        return "это фиаско братан", b"OggS fake"
+
+    async def fake_meme(t, texts):
+        return "Drake Hotline Bling", b"\xff\xd8 fake"
+    old = fun.sound, fun.meme
+    fun.sound, fun.meme = fake_sound, fake_meme
+    try:
+        SCRIPT.append([{"type": "sound", "query": "фиаско"}, {"type": "meme", "template": "Drake", "texts": ["а", "б"]},
+                       {"type": "dice", "emoji": "🎯"}])
+        await feed(message=msg("альтрон ну и фиаско"))
+        assert S.of("SendVoice") and S.of("SendPhoto") and S.of("SendDice")[-1].emoji == "🎯"
+        assert B.db.execute("SELECT count(*) FROM messages WHERE text LIKE '[мемный звук%'").fetchone()[0]
+    finally:
+        fun.sound, fun.meme = old
+
+
 async def t_menu_open():
     await feed(message=msg("/menu", user=OWNER, chat=OWNER, name="Староста"))
     r = S.of("SendRichMessage")[-1]

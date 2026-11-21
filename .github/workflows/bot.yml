@@ -32,6 +32,9 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - name: ffmpeg для мемных звуков
+        run: command -v ffmpeg || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+
       - name: Ключ к репозиторию памяти
         run: |
           mkdir -p ~/.ssh
