@@ -314,6 +314,12 @@ async def t_search_then_answer():
         B.web_search = old
 
 
+async def t_learn_slang():
+    SCRIPT.append([{"type": "learn_slang", "term": "тюбик", "meaning": "тест-значение"}, {"type": "reply", "text": "запомнил"}])
+    await feed(message=msg("альтрон тюбик это тест-значение, запомни"))
+    assert any(x["term"] == "тюбик" for x in B.setting(0, "slang", []))
+
+
 async def t_menu_open():
     await feed(message=msg("/menu", user=OWNER, chat=OWNER, name="Староста"))
     r = S.of("SendRichMessage")[-1]
